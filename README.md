@@ -197,3 +197,7 @@ karaoke-app/
     ├── requirements.txt
     └── Dockerfile
 ```
+
+## 🎯 Roadmap
+- [ ] Support for custom LRC files
+- [ ] Offline mode
