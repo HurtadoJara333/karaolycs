@@ -191,3 +191,4 @@ export default function KaraokeOrchestrator() {
     />
   );
 }
+// TODO: Add cover art component
