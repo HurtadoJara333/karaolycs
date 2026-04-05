@@ -22,3 +22,7 @@
 │   ├── requirements.txt
 │   └── Dockerfile
 └── .env.local
+
+## Future Improvements
+- Add WebSocket support for real-time lyrics sync
+- Implement song queue functionality
