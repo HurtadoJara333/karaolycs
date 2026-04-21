@@ -1,125 +1,201 @@
-// app/api/recognize/route.ts
 import { NextRequest, NextResponse } from "next/server";
+import crypto from "crypto";
 
-const PYTHON_SERVICE_URL =
-  process.env.PYTHON_SERVICE_URL ?? "http://localhost:8000";
+// ─── Tipos ────────────────────────────────────────────────────────────────────
+
+interface ACRCloudMetadata {
+  music?: Array<{
+    title: string;
+    artists: Array<{ name: string }>;
+    album?: { name: string };
+    play_offset_ms?: number;
+    duration_ms?: number;
+    external_ids?: { isrc?: string };
+  }>;
+}
+
+interface ACRCloudResponse {
+  status: { code: number; msg: string };
+  metadata?: ACRCloudMetadata;
+  result_type?: number;
+}
+
+interface RecognizeResult {
+  title: string;
+  artist: string;
+  album: string;
+  playOffsetMs: number;
+  durationMs: number;
+  provider: "acrcloud";
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function buildACRCloudSignature(
+  accessKey: string,
+  accessSecret: string,
+  timestamp: number,
+  dataType: string = "audio",
+  signatureVersion: string = "1"
+): { signature: string; timestamp: number } {
+  const stringToSign = [
+    "POST",
+    "/v1/identify",
+    accessKey,
+    dataType,
+    signatureVersion,
+    timestamp.toString(),
+  ].join("\n");
+
+  const signature = crypto
+    .createHmac("sha1", accessSecret)
+    .update(stringToSign)
+    .digest("base64");
+
+  return { signature, timestamp };
+}
+
+async function identifyWithACRCloud(
+  audioBuffer: Buffer,
+  host: string,
+  accessKey: string,
+  accessSecret: string
+): Promise<RecognizeResult | null> {
+  const timestamp = Math.floor(Date.now() / 1000);
+  const { signature } = buildACRCloudSignature(
+    accessKey,
+    accessSecret,
+    timestamp
+  );
+
+  const formData = new FormData();
+  formData.append(
+    "sample",
+    new Blob([audioBuffer], { type: "audio/webm" }),
+    "sample.webm"
+  );
+  formData.append("access_key", accessKey);
+  formData.append("data_type", "audio");
+  formData.append("signature_version", "1");
+  formData.append("signature", signature);
+  formData.append("sample_bytes", audioBuffer.length.toString());
+  formData.append("timestamp", timestamp.toString());
+
+  const url = `https://${host}/v1/identify`;
+
+  const res = await fetch(url, {
+    method: "POST",
+    body: formData,
+    signal: AbortSignal.timeout(15000),
+  });
+
+  if (!res.ok) {
+    console.error("ACRCloud HTTP error:", res.status, await res.text());
+    return null;
+  }
+
+  const data: ACRCloudResponse = await res.json();
+
+  // code 0 = éxito, 1001 = no encontrado
+  if (data.status.code !== 0) {
+    console.warn("ACRCloud no encontró la canción:", data.status.msg);
+    return null;
+  }
+
+  const music = data.metadata?.music?.[0];
+  if (!music) return null;
+
+  return {
+    title: music.title ?? "Desconocido",
+    artist: music.artists?.[0]?.name ?? "Desconocido",
+    album: music.album?.name ?? "",
+    playOffsetMs: music.play_offset_ms ?? 0,
+    durationMs: music.duration_ms ?? 0,
+    provider: "acrcloud",
+  };
+}
+
+// ─── GET /api/recognize — health check ───────────────────────────────────────
+
+export async function GET() {
+  const hasACR =
+    !!process.env.ACR_HOST &&
+    !!process.env.ACR_ACCESS_KEY &&
+    !!process.env.ACR_ACCESS_SECRET;
+
+  return NextResponse.json({
+    providers: { acrcloud: hasACR },
+    status: hasACR ? "ready" : "missing_credentials",
+  });
+}
+
+// ─── POST /api/recognize — reconocimiento principal ───────────────────────────
 
 export async function POST(req: NextRequest) {
   try {
-    const formData = await req.formData();
-    const audioFile = formData.get("audio") as File | null;
+    // Leer el audio del body (FormData o raw binary)
+    const contentType = req.headers.get("content-type") ?? "";
 
-    if (!audioFile) {
-      return NextResponse.json(
-        { success: false, error: "No audio file provided" },
-        { status: 400 }
-      );
-    }
+    let audioBuffer: Buffer;
 
-    // Validar tamaño mínimo (1KB)
-    if (audioFile.size < 1000) {
-      return NextResponse.json(
-        { success: false, error: "Audio file too small" },
-        { status: 400 }
-      );
-    }
-
-    // Forward al microservicio Python
-    const forward = new FormData();
-    forward.append("audio", audioFile, audioFile.name || "snippet.webm");
-
-    // Intentar con reintentos (máximo 2 reintentos)
-    let lastError: string = "Unknown error";
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        const res = await fetch(`${PYTHON_SERVICE_URL}/recognize`, {
-          method: "POST",
-          body: forward,
-          signal: AbortSignal.timeout(20_000), // 20s max (ACRCloud puede ser lento)
-        });
-
-        if (!res.ok) {
-          const text = await res.text().catch(() => "Unknown error");
-          console.error(`[/api/recognize] Python service error (attempt ${attempt + 1}):`, text);
-          lastError = `Service error: ${res.status}`;
-          
-          // Esperar antes de reintentar (backoff exponencial)
-          if (attempt < 2) {
-            await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
-            continue;
-          }
-          
-          return NextResponse.json(
-            { success: false, error: "Recognition service unavailable" },
-            { status: 502 }
-          );
-        }
-
-        const data = await res.json();
-        return NextResponse.json(data);
-
-      } catch (fetchError: unknown) {
-        const message = fetchError instanceof Error ? fetchError.message : "Unknown error";
-        console.error(`[/api/recognize] Fetch error (attempt ${attempt + 1}):`, message);
-        lastError = message;
-
-        // Si es timeout o conexión rechazada, reintentar
-        if (message.includes("timeout") || message.includes("ECONNREFUSED")) {
-          if (attempt < 2) {
-            await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
-            continue;
-          }
-        }
-        
-        // Otros errores no se reintentan
-        break;
+    if (contentType.includes("multipart/form-data")) {
+      const formData = await req.formData();
+      const file = formData.get("sample") as File | null;
+      if (!file) {
+        return NextResponse.json(
+          { error: "No se recibió audio (campo 'sample' faltante)" },
+          { status: 400 }
+        );
       }
+      audioBuffer = Buffer.from(await file.arrayBuffer());
+    } else {
+      // Raw binary / application/octet-stream
+      const arrayBuffer = await req.arrayBuffer();
+      if (!arrayBuffer.byteLength) {
+        return NextResponse.json(
+          { error: "Body vacío" },
+          { status: 400 }
+        );
+      }
+      audioBuffer = Buffer.from(arrayBuffer);
     }
 
-    return NextResponse.json(
-      { success: false, error: lastError },
-      { status: 500 }
-    );
+    // Validar credenciales
+    const host = process.env.ACR_HOST;
+    const accessKey = process.env.ACR_ACCESS_KEY;
+    const accessSecret = process.env.ACR_ACCESS_SECRET;
 
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : "Unknown error";
-    console.error("[/api/recognize] Unexpected error:", message);
-    return NextResponse.json(
-      { success: false, error: message },
-      { status: 500 }
-    );
-  }
-}
-
-// Endpoint de salud para verificar el estado del servicio
-export async function GET() {
-  try {
-    const res = await fetch(`${PYTHON_SERVICE_URL}/health`, {
-      signal: AbortSignal.timeout(5_000),
-    });
-    
-    if (!res.ok) {
+    if (!host || !accessKey || !accessSecret) {
       return NextResponse.json(
-        { status: "error", python: "unavailable" },
+        {
+          error:
+            "Credenciales de ACRCloud no configuradas. Revisa ACR_HOST, ACR_ACCESS_KEY y ACR_ACCESS_SECRET en las variables de entorno.",
+        },
         { status: 503 }
       );
     }
-    
-    const data = await res.json();
-    return NextResponse.json({ status: "ok", python: data });
-  } catch {
+
+    // Reconocer
+    const result = await identifyWithACRCloud(
+      audioBuffer,
+      host,
+      accessKey,
+      accessSecret
+    );
+
+    if (!result) {
+      return NextResponse.json(
+        { error: "No se pudo identificar la canción" },
+        { status: 404 }
+      );
+    }
+
+    return NextResponse.json(result);
+  } catch (err) {
+    console.error("Error en /api/recognize:", err);
     return NextResponse.json(
-      { status: "error", python: "unreachable" },
-      { status: 503 }
+      { error: "Error interno del servidor" },
+      { status: 500 }
     );
   }
 }
-
-// Max body size para audio (~2MB para 8s de webm)
-export const config = {
-  api: { 
-    bodyParser: {
-      sizeLimit: '2mb',
-    },
-  },
-};
