@@ -1,72 +1,56 @@
 import { NextRequest, NextResponse } from "next/server";
 import crypto from "crypto";
 
-// ─── Tipos ────────────────────────────────────────────────────────────────────
-
-interface ACRCloudMetadata {
-  music?: Array<{
-    title: string;
-    artists: Array<{ name: string }>;
-    album?: { name: string };
-    play_offset_ms?: number;
-    duration_ms?: number;
-    external_ids?: { isrc?: string };
-  }>;
-}
+// ─── Tipos ACRCloud ───────────────────────────────────────────────────────────
 
 interface ACRCloudResponse {
   status: { code: number; msg: string };
-  metadata?: ACRCloudMetadata;
-  result_type?: number;
+  metadata?: {
+    music?: Array<{
+      title: string;
+      artists: Array<{ name: string }>;
+      album?: { name: string };
+      play_offset_ms?: number;
+      duration_ms?: number;
+    }>;
+  };
 }
 
-interface RecognizeResult {
-  title: string;
-  artist: string;
-  album: string;
-  playOffsetMs: number;
-  durationMs: number;
-  provider: "acrcloud";
-}
+// ─── Firma HMAC ───────────────────────────────────────────────────────────────
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
-function buildACRCloudSignature(
+function buildSignature(
   accessKey: string,
   accessSecret: string,
-  timestamp: number,
-  dataType: string = "audio",
-  signatureVersion: string = "1"
-): { signature: string; timestamp: number } {
+  timestamp: number
+): string {
   const stringToSign = [
     "POST",
     "/v1/identify",
     accessKey,
-    dataType,
-    signatureVersion,
+    "audio",
+    "1",
     timestamp.toString(),
   ].join("\n");
 
-  const signature = crypto
+  return crypto
     .createHmac("sha1", accessSecret)
     .update(stringToSign)
     .digest("base64");
-
-  return { signature, timestamp };
 }
 
-async function identifyWithACRCloud(
-  audioBuffer: Buffer,
-  host: string,
-  accessKey: string,
-  accessSecret: string
-): Promise<RecognizeResult | null> {
-  const timestamp = Math.floor(Date.now() / 1000);
-  const { signature } = buildACRCloudSignature(
-    accessKey,
-    accessSecret,
-    timestamp
-  );
+// ─── ACRCloud ─────────────────────────────────────────────────────────────────
+
+async function identifyWithACRCloud(audioBuffer: Buffer): Promise<{
+  title: string;
+  artist: string;
+  timecode: number;
+  coverUrl: string | null;
+} | null> {
+  const host        = process.env.ACR_HOST!;
+  const accessKey   = process.env.ACR_ACCESS_KEY!;
+  const accessSecret = process.env.ACR_ACCESS_SECRET!;
+  const timestamp   = Math.floor(Date.now() / 1000);
+  const signature   = buildSignature(accessKey, accessSecret, timestamp);
 
   const formData = new FormData();
   formData.append(
@@ -81,9 +65,7 @@ async function identifyWithACRCloud(
   formData.append("sample_bytes", audioBuffer.length.toString());
   formData.append("timestamp", timestamp.toString());
 
-  const url = `https://${host}/v1/identify`;
-
-  const res = await fetch(url, {
+  const res = await fetch(`https://${host}/v1/identify`, {
     method: "POST",
     body: formData,
     signal: AbortSignal.timeout(15000),
@@ -96,9 +78,8 @@ async function identifyWithACRCloud(
 
   const data: ACRCloudResponse = await res.json();
 
-  // code 0 = éxito, 1001 = no encontrado
   if (data.status.code !== 0) {
-    console.warn("ACRCloud no encontró la canción:", data.status.msg);
+    console.warn("ACRCloud sin resultado:", data.status.code, data.status.msg);
     return null;
   }
 
@@ -106,12 +87,10 @@ async function identifyWithACRCloud(
   if (!music) return null;
 
   return {
-    title: music.title ?? "Desconocido",
-    artist: music.artists?.[0]?.name ?? "Desconocido",
-    album: music.album?.name ?? "",
-    playOffsetMs: music.play_offset_ms ?? 0,
-    durationMs: music.duration_ms ?? 0,
-    provider: "acrcloud",
+    title:    music.title ?? "Desconocido",
+    artist:   music.artists?.[0]?.name ?? "Desconocido",
+    timecode: (music.play_offset_ms ?? 0) / 1000,  // ms → segundos
+    coverUrl: null, // ACRCloud free tier no devuelve cover art
   };
 }
 
@@ -129,72 +108,75 @@ export async function GET() {
   });
 }
 
-// ─── POST /api/recognize — reconocimiento principal ───────────────────────────
+// ─── POST /api/recognize ──────────────────────────────────────────────────────
 
 export async function POST(req: NextRequest) {
   try {
-    // Leer el audio del body (FormData o raw binary)
-    const contentType = req.headers.get("content-type") ?? "";
-
-    let audioBuffer: Buffer;
-
-    if (contentType.includes("multipart/form-data")) {
-      const formData = await req.formData();
-      const file = formData.get("sample") as File | null;
-      if (!file) {
-        return NextResponse.json(
-          { error: "No se recibió audio (campo 'sample' faltante)" },
-          { status: 400 }
-        );
-      }
-      audioBuffer = Buffer.from(await file.arrayBuffer());
-    } else {
-      // Raw binary / application/octet-stream
-      const arrayBuffer = await req.arrayBuffer();
-      if (!arrayBuffer.byteLength) {
-        return NextResponse.json(
-          { error: "Body vacío" },
-          { status: 400 }
-        );
-      }
-      audioBuffer = Buffer.from(arrayBuffer);
-    }
-
-    // Validar credenciales
-    const host = process.env.ACR_HOST;
-    const accessKey = process.env.ACR_ACCESS_KEY;
-    const accessSecret = process.env.ACR_ACCESS_SECRET;
-
-    if (!host || !accessKey || !accessSecret) {
+    // Credenciales primero — falla rápido si no están configuradas
+    if (
+      !process.env.ACR_HOST ||
+      !process.env.ACR_ACCESS_KEY ||
+      !process.env.ACR_ACCESS_SECRET
+    ) {
       return NextResponse.json(
-        {
-          error:
-            "Credenciales de ACRCloud no configuradas. Revisa ACR_HOST, ACR_ACCESS_KEY y ACR_ACCESS_SECRET en las variables de entorno.",
-        },
+        { success: false, error: "Credenciales de ACRCloud no configuradas." },
         { status: 503 }
       );
     }
 
-    // Reconocer
-    const result = await identifyWithACRCloud(
-      audioBuffer,
-      host,
-      accessKey,
-      accessSecret
-    );
+    // ── Leer audio (acepta cualquier formato que envíe el frontend) ──────────
+    const contentType = req.headers.get("content-type") ?? "";
+    let audioBuffer: Buffer | null = null;
 
-    if (!result) {
+    if (contentType.includes("multipart/form-data")) {
+      // FormData: busca cualquier File/Blob sin importar el nombre del campo
+      const formData = await req.formData();
+      const entries = Array.from(formData.entries()) as Array<[string, FormDataEntryValue]>;
+      for (const [key, value] of entries) {
+        if (value instanceof File || value instanceof Blob) {
+          console.log("[recognize] FormData field:", key, "size:", value.size);
+          audioBuffer = Buffer.from(await value.arrayBuffer());
+          break;
+        }
+      }
+    } else if (contentType.includes("application/json")) {
+      const json = (await req.json()) as { audio?: string };
+      if (json.audio) audioBuffer = Buffer.from(json.audio, "base64");
+    } else {
+      // Raw binary (audio/webm, application/octet-stream, sin Content-Type…)
+      const ab = await req.arrayBuffer();
+      if (ab.byteLength > 0) audioBuffer = Buffer.from(ab);
+    }
+
+    if (!audioBuffer || audioBuffer.byteLength === 0) {
       return NextResponse.json(
-        { error: "No se pudo identificar la canción" },
-        { status: 404 }
+        {
+          success: false,
+          error: "No se recibió audio.",
+          debug: { contentType },
+        },
+        { status: 400 }
       );
     }
 
-    return NextResponse.json(result);
+    console.log("[recognize] Audio recibido:", audioBuffer.byteLength, "bytes");
+
+    // ── Reconocer ────────────────────────────────────────────────────────────
+    const song = await identifyWithACRCloud(audioBuffer);
+
+    if (!song) {
+      return NextResponse.json(
+        { success: false, song: null },
+        { status: 200 } // 200 para que el frontend lo maneje como "no encontrado"
+      );
+    }
+
+    // ── Respuesta en el formato que espera KaraokeOrchestrator ───────────────
+    return NextResponse.json({ success: true, song });
   } catch (err) {
-    console.error("Error en /api/recognize:", err);
+    console.error("[recognize] Error:", err);
     return NextResponse.json(
-      { error: "Error interno del servidor" },
+      { success: false, error: "Error interno del servidor" },
       { status: 500 }
     );
   }
