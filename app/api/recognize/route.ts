@@ -76,12 +76,13 @@ async function identifyWithACRCloud(audioBuffer: Buffer): Promise<{
     return null;
   }
 
-  const data: ACRCloudResponse = await res.json();
+const data: ACRCloudResponse = await res.json();
+console.log("[ACRCloud] Respuesta completa:", JSON.stringify(data));  // ← agrega esta línea
 
-  if (data.status.code !== 0) {
-    console.warn("ACRCloud sin resultado:", data.status.code, data.status.msg);
-    return null;
-  }
+if (data.status.code !== 0) {
+  console.warn("ACRCloud sin resultado:", data.status.code, data.status.msg);
+  return null;
+}
 
   const music = data.metadata?.music?.[0];
   if (!music) return null;
