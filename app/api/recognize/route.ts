@@ -132,13 +132,15 @@ export async function POST(req: NextRequest) {
       // FormData: busca cualquier File/Blob sin importar el nombre del campo
       const formData = await req.formData();
       const entries = Array.from(formData.entries()) as Array<[string, FormDataEntryValue]>;
-      for (const [key, value] of entries) {
-        if (value instanceof File || value instanceof Blob) {
-          console.log("[recognize] FormData field:", key, "size:", value.size);
-          audioBuffer = Buffer.from(await value.arrayBuffer());
-          break;
-        }
-      }
+for (const [key, value] of formData.entries()) {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const entry = value as any;
+  if (entry instanceof File || entry instanceof Blob) {
+    console.log("[recognize] FormData field:", key, "size:", entry.size);
+    audioBuffer = Buffer.from(await entry.arrayBuffer());
+    break;
+  }
+}
     } else if (contentType.includes("application/json")) {
       const json = (await req.json()) as { audio?: string };
       if (json.audio) audioBuffer = Buffer.from(json.audio, "base64");
