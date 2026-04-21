@@ -1,9 +1,5 @@
 "use client";
 // components/KaraokeOrchestrator.tsx
-//
-// Componente raíz que conecta:
-//   AudioCapture → /api/recognize → LRCLIB → SyncEngine → Teleprompter
-//
 import { useCallback, useEffect, useRef } from "react";
 import { useKaraokeStore } from "@/hooks/useKaraokeStore";
 import { useSyncEngine } from "@/hooks/useSyncEngine";
@@ -14,7 +10,7 @@ import KaraokeTeleprompter from "./KaraokeTeleprompter";
 
 export default function KaraokeOrchestrator() {
   const {
-    status, setStatus,
+    setStatus,
     currentSong, setCurrentSong,
     setLines,
     detectionInterval,
@@ -32,47 +28,51 @@ export default function KaraokeOrchestrator() {
   const { startSync, pauseSync } = useSyncEngine();
   const detectionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isRunningRef      = useRef(false);
+  const isDetectingRef    = useRef(false); // evita llamadas solapadas
 
-  // ─── Core detection pipeline ───────────────────────────────────────────────
+  // ─── Programar siguiente detección ────────────────────────────────────────
+  const scheduleNextDetection = useCallback(() => {
+    if (!isRunningRef.current) return;
+    if (detectionTimerRef.current) clearTimeout(detectionTimerRef.current);
+
+    detectionTimerRef.current = setTimeout(async () => {
+      if (!isRunningRef.current || isDetectingRef.current) return;
+      setStatus("listening");
+      await captureSnippet();
+    }, detectionInterval * 1000);
+  // captureSnippet se define abajo — se agrega en el dep array tras declararlo
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [detectionInterval, setStatus]);
+
+  // ─── Pipeline de detección ─────────────────────────────────────────────────
   const runDetection = useCallback(async (audioBlob: Blob, captureStartTime: number) => {
+    if (isDetectingRef.current) return; // evitar solapamiento
+    isDetectingRef.current = true;
     setIsDetecting(true);
     setStatus("detecting");
-    
-    const recordMs = 8000;
-    const recordSeconds = 8;
-    
-    // Registrar cuando empezo la grabacion
     setCaptureStartTime(captureStartTime);
-    setRecordingDuration(recordMs);
+    setRecordingDuration(8000);
 
     try {
-      // 1. Enviar audio a ACRCloud
       const detectionStart = performance.now();
       const form = new FormData();
       form.append("audio", audioBlob, "snippet.webm");
 
       const res  = await fetch("/api/recognize", { method: "POST", body: form });
       const data: RecognizeResponse = await res.json();
-      
-      // Acumular delay de deteccion
-      const detectionDelay = performance.now() - detectionStart;
-      addDetectionDelay(detectionDelay);
+
+      addDetectionDelay(performance.now() - detectionStart);
 
       if (!data.success || !data.song) {
         setStatus("listening");
-        setIsDetecting(false);
-        scheduleNextDetection();
-        return;
+        return; // scheduleNextDetection se llama en finally
       }
 
-      // Extraer song y cover_url del JSON (puede venir como cover_url de Python)
       const { song } = data;
-      const coverUrlFromResponse = (data.song as any).cover_url || song?.coverUrl || null;
-      
-      console.log("[Orchestrator] Cover desde API:", (data.song as any).cover_url);
-      console.log("[Orchestrator] Cover extraido:", coverUrlFromResponse);
+      const coverUrlFromResponse = (data.song as any).cover_url ?? song?.coverUrl ?? null;
+      setCoverUrl(coverUrlFromResponse);
 
-      // 2. Comprobar si es la misma canción
+      // ¿Misma canción?
       const isSameSong =
         currentSong?.title === song.title &&
         currentSong?.artist === song.artist;
@@ -80,61 +80,41 @@ export default function KaraokeOrchestrator() {
       if (isSameSong) {
         const lines = useKaraokeStore.getState().lines;
         if (lines.length > 0) {
-          const realTimecode = getCurrentTimecode(song.timecode);
-          console.log(`[Orchestrator] Same song - Timecode real: ${realTimecode.toFixed(2)}s`);
-          startSync(lines, realTimecode);
+          startSync(lines, getCurrentTimecode(song.timecode));
           setCurrentSong(song);
-          scheduleNextDetection();
-          setIsDetecting(false);
           return;
         }
       }
 
-      // 3. Buscar letra en LRCLIB
+      // Buscar letras
       setStatus("fetching");
       setCurrentSong(song);
-      setCoverUrl(coverUrlFromResponse);
-      
+
       const lyricsStart = performance.now();
       const lines = await fetchSyncedLyrics(song.title, song.artist);
-      const lyricsDelay = performance.now() - lyricsStart;
-      setLyricsSearchDelay(lyricsDelay);
+      setLyricsSearchDelay(performance.now() - lyricsStart);
 
       if (!lines) {
         setStatus("no_lyrics");
-        setIsDetecting(false);
-        scheduleNextDetection();
         return;
       }
 
-      // 4. Calcular timecode real en este momento exacto
-      const realTimecode = getCurrentTimecode(song.timecode);
-
-      const now = performance.now();
-      const totalElapsed = (now - captureStartTime) / 1000;
-
-      console.log(`[Orchestrator] ======`);
-      console.log(`[Orchestrator] Grabacion: ${recordSeconds}s`);
-      console.log(`[Orchestrator] Delay ACRCloud: ${(detectionDelay / 1000).toFixed(2)}s`);
-      console.log(`[Orchestrator] Delay LRCLIB: ${(lyricsDelay / 1000).toFixed(2)}s`);
-      console.log(`[Orchestrator] Tiempo total desde inicio captura: ${totalElapsed.toFixed(2)}s`);
-      console.log(`[Orchestrator] Timecode ACRCloud: ${song.timecode.toFixed(2)}s`);
-      console.log(`[Orchestrator] Timecode real (AHORA): ${realTimecode.toFixed(2)}s`);
-      console.log(`[Orchestrator] ======`);
-
-      // 5. Arrancar teleprompter
       setLines(lines);
-      startSync(lines, realTimecode);
+      startSync(lines, getCurrentTimecode(song.timecode));
 
     } catch (err) {
-      console.error("[Orchestrator] Detection error:", err);
-      setError("Error de conexion - reintentando…");
+      console.error("[Orchestrator] Error:", err);
+      setError("Error de conexión — reintentando…");
       setStatus("error");
     } finally {
+      isDetectingRef.current = false;
       setIsDetecting(false);
-      scheduleNextDetection();
+      scheduleNextDetection(); // UNA sola vez, siempre al final
     }
-  }, [currentSong, startSync, setStatus, setIsDetecting, setCurrentSong, setLines, setError, setCaptureStartTime, setRecordingDuration, addDetectionDelay, setLyricsSearchDelay, getCurrentTimecode]);
+  }, [currentSong, startSync, setStatus, setIsDetecting, setCurrentSong,
+      setLines, setError, setCaptureStartTime, setRecordingDuration,
+      addDetectionDelay, setLyricsSearchDelay, getCurrentTimecode,
+      setCoverUrl, scheduleNextDetection]);
 
   // ─── Audio capture ─────────────────────────────────────────────────────────
   const { captureSnippet, requestPermission, stopStream, hasPermission } =
@@ -144,45 +124,31 @@ export default function KaraokeOrchestrator() {
       onRecordingStart: (startTime) => setCaptureStartTime(startTime),
     });
 
-  // ─── Detection loop ─────────────────────────────────────────────────────────
-  const scheduleNextDetection = useCallback(() => {
-    if (!isRunningRef.current) return;
-
-    detectionTimerRef.current = setTimeout(async () => {
-      if (!isRunningRef.current) return;
-      setStatus("listening");
-      await captureSnippet();
-    }, detectionInterval * 1000);
-  }, [captureSnippet, detectionInterval, setStatus]);
-
-  // ─── Start / Stop ───────────────────────────────────────────────────────────
+  // ─── Start / Stop ──────────────────────────────────────────────────────────
   const startListening = useCallback(async () => {
     const ok = await requestPermission();
-    if (!ok) {
-      setError("Permiso de micrófono denegado");
-      return;
-    }
+    if (!ok) { setError("Permiso de micrófono denegado"); return; }
     isRunningRef.current = true;
+    isDetectingRef.current = false;
     setStatus("listening");
-    await captureSnippet(); // primera detección inmediata
+    await captureSnippet();
   }, [requestPermission, captureSnippet, setStatus, setError]);
 
   const stopListening = useCallback(() => {
     isRunningRef.current = false;
+    isDetectingRef.current = false;
     if (detectionTimerRef.current) clearTimeout(detectionTimerRef.current);
     pauseSync();
     stopStream();
     reset();
   }, [pauseSync, stopStream, reset]);
 
-  // Cleanup on unmount
   useEffect(() => () => {
     isRunningRef.current = false;
     if (detectionTimerRef.current) clearTimeout(detectionTimerRef.current);
     stopStream();
   }, [stopStream]);
 
-  // ─── Render ─────────────────────────────────────────────────────────────────
   return (
     <KaraokeTeleprompter
       onStart={startListening}
@@ -191,4 +157,3 @@ export default function KaraokeOrchestrator() {
     />
   );
 }
-// TODO: Add cover art component
