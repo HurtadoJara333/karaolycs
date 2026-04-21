@@ -106,8 +106,7 @@ console.log("[recognize] FormData field:", key, "size:", entry.size, "type:", en
       );
     }
 
-    console.log("[recognize] Audio bytes:", audioData.byteLength);
-    console.log("[recognize] Audio primeros bytes (hex):", Buffer.from(audioData.slice(0, 16)).toString("hex"));
+   console.log("[recognize] Bytes recibidos:", audioData?.byteLength ?? 0);
 
     const song = await recognizeWithACR(audioData);
 
