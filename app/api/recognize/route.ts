@@ -90,8 +90,7 @@ export async function POST(req: NextRequest) {
       for (const [key, value] of formData.entries()) {
         const entry = value as any;
         if (entry instanceof File || entry instanceof Blob) {
-          console.log("[recognize] FormData field:", key, "type:", entry.type, "size:", entry.size, "name:", entry.name);
-          audioData = new Uint8Array(await entry.arrayBuffer());
+console.log("[recognize] FormData field:", key, "size:", entry.size, "type:", entry.type);          audioData = new Uint8Array(await entry.arrayBuffer());
           break;
         }
       }
