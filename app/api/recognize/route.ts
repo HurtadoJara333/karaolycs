@@ -71,7 +71,7 @@ async function identifyWithACRCloud(
   const formData = new FormData();
   formData.append(
     "sample",
-    new Blob([audioBuffer], { type: "audio/webm" }),
+    new Blob([new Uint8Array(audioBuffer)], { type: "audio/webm" }),
     "sample.webm"
   );
   formData.append("access_key", accessKey);
